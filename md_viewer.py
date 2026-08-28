@@ -23,10 +23,21 @@ import urllib.parse
 import webbrowser
 
 
-APP_TITLE = "Markdown Viewer"
+__VERSION__ = "1.0.0"
+APP_TITLE = "Markdown Table Viewer"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
 TUI_TABLE_CELL_MAX = 38
+TUI_KEY_ALIASES = {
+    "й": "q",
+    "л": "k",
+    "о": "j",
+    "к": "r",
+    "и": "b",
+    "т": "n",
+    "з": "p",
+    ".": "/",
+}
 
 
 def escape_text(value):
@@ -1287,6 +1298,29 @@ def tui_addstr(stdscr, y, x, text, attr=0):
         return
 
 
+def tui_hotkey(key):
+    """Normalize Latin, Russian-layout and Caps Lock TUI hotkeys.
+
+    Нормализует TUI-hotkey для латиницы, русской раскладки и Caps Lock.
+
+    Args:
+        key (str | int): Value returned by curses / значение от curses.
+
+    Returns:
+        str | int: Canonical hotkey or unchanged curses constant /
+            канонический hotkey или исходная curses-константа.
+    """
+    if not isinstance(key, str):
+        return key
+    normalized = key.lower()
+    return TUI_KEY_ALIASES.get(normalized, normalized)
+
+
+def tui_is_search_key(key):
+    """Return whether a key opens TUI search."""
+    return key == curses.KEY_F7 or tui_hotkey(key) == "/"
+
+
 def tui_slice(line, x_offset):
     """Apply horizontal scroll to one rendered line.
 
@@ -1302,6 +1336,83 @@ def tui_slice(line, x_offset):
     if x_offset <= 0:
         return line
     return line[x_offset:]
+
+
+def tui_find_matches(document_lines, query):
+    """Find non-overlapping literal search matches in rendered TUI lines.
+
+    Находит непересекающиеся литеральные совпадения в строках TUI.
+
+    Args:
+        document_lines (list[str]): Rendered document lines / строки документа.
+        query (str): Search text / текст поиска.
+
+    Returns:
+        list[tuple[int, int, int]]: Line, start and end for every match /
+            строка, начало и конец каждого совпадения.
+    """
+    if not query:
+        return []
+    pattern = re.compile(re.escape(query), re.IGNORECASE)
+    return [
+        (line_index, match.start(), match.end())
+        for line_index, line in enumerate(document_lines)
+        for match in pattern.finditer(line)
+    ]
+
+
+def tui_initial_match(matches, scroll):
+    """Return the first match at or below the current scroll position.
+
+    Возвращает первое совпадение на текущей строке прокрутки или ниже.
+    """
+    for index, match in enumerate(matches):
+        if match[0] >= scroll:
+            return index
+    return 0
+
+
+def tui_move_match(matches, current, step):
+    """Move to the next or previous match with wrap-around.
+
+    Перемещается к следующему или предыдущему совпадению по кругу.
+    """
+    if not matches:
+        return 0
+    return (current + step) % len(matches)
+
+
+def tui_max_scroll(line_count, screen_height):
+    """Return the last scroll position that fills the document viewport.
+
+    Возвращает последнюю позицию прокрутки без пустого места под документом.
+    """
+    body_height = max(1, screen_height - 2)
+    return max(0, line_count - body_height)
+
+
+def tui_render_search_line(stdscr, y, line, x_offset, ranges, base_attr=0):
+    """Render one line and invert all visible search matches.
+
+    Рендерит строку и инвертирует все видимые совпадения поиска.
+    """
+    visible = tui_slice(line, x_offset)
+    cursor = 0
+    for start, end in ranges:
+        visible_start = max(0, start - x_offset)
+        visible_end = min(len(visible), end - x_offset)
+        if visible_end <= visible_start:
+            continue
+        tui_addstr(stdscr, y, cursor, visible[cursor:visible_start], base_attr)
+        tui_addstr(
+            stdscr,
+            y,
+            visible_start,
+            visible[visible_start:visible_end],
+            base_attr | curses.A_REVERSE,
+        )
+        cursor = visible_end
+    tui_addstr(stdscr, y, cursor, visible[cursor:], base_attr)
 
 
 def tui_status(stdscr, text):
@@ -1347,7 +1458,36 @@ def tui_render_file_list(stdscr, files, selected, scroll):
     tui_status(stdscr, "Enter открыть | ↑↓ выбор | q выход")
 
 
-def tui_render_document(stdscr, path, document_lines, scroll, x_offset):
+def tui_document_status(search_query="", match_count=0, search_index=0):
+    """Build the document status line, including active search controls.
+
+    Формирует строку состояния документа вместе с активным поиском.
+    """
+    if search_query:
+        count = "{}/{}".format(search_index + 1, match_count) if match_count else "0/0"
+        search_status = "Поиск /{} [{}] | n следующее | p предыдущее | F7 новый поиск".format(
+            search_query,
+            count,
+        )
+    else:
+        search_status = "F7 поиск"
+    return (
+        "↑↓ PgUp/PgDn | ←→ горизонтально | {} | "
+        "Home/End | r обновить | b список | q выход"
+    ).format(search_status)
+
+
+def tui_render_document(
+    stdscr,
+    path,
+    document_lines,
+    scroll,
+    x_offset,
+    search_query="",
+    search_matches=None,
+    search_index=0,
+    search_editing=False,
+):
     """Render the opened document in TUI mode.
 
     Рендерит открытый документ в TUI-режиме.
@@ -1358,6 +1498,10 @@ def tui_render_document(stdscr, path, document_lines, scroll, x_offset):
         document_lines (list[str]): Rendered lines / отрендеренные строки.
         scroll (int): First visible line / первая видимая строка.
         x_offset (int): Horizontal offset / горизонтальное смещение.
+        search_query (str): Current search text / текущий текст поиска.
+        search_matches (list[tuple[int, int, int]]): Search matches / совпадения.
+        search_index (int): Active match index / индекс активного совпадения.
+        search_editing (bool): Whether search input is active / активен ли ввод поиска.
 
     Returns:
         None.
@@ -1371,16 +1515,38 @@ def tui_render_document(stdscr, path, document_lines, scroll, x_offset):
     )
     tui_addstr(stdscr, 0, 0, title[:max(0, width - 1)], curses.A_BOLD)
 
+    search_matches = search_matches or []
+    ranges_by_line = {}
+    for line_index, start, end in search_matches:
+        ranges_by_line.setdefault(line_index, []).append((start, end))
+
     body_height = max(1, height - 2)
     for row in range(body_height):
         index = scroll + row
         if index >= len(document_lines):
             break
-        line = tui_slice(document_lines[index], x_offset)
+        line = document_lines[index]
         attr = curses.A_BOLD if line.startswith(("+", "|")) else 0
-        tui_addstr(stdscr, row + 1, 0, line, attr)
+        tui_render_search_line(
+            stdscr,
+            row + 1,
+            line,
+            x_offset,
+            ranges_by_line.get(index, []),
+            attr,
+        )
 
-    tui_status(stdscr, "↑↓ PgUp/PgDn прокрутка | ←→ горизонтально | Home/End | r обновить | b список | q выход")
+    if search_editing:
+        count = "{}/{}".format(search_index + 1, len(search_matches)) if search_matches else "0/0"
+        tui_status(stdscr, "/{}  [{}] | Enter завершить | Esc закрыть".format(search_query, count))
+        try:
+            stdscr.move(height - 1, min(len(search_query) + 1, max(0, width - 2)))
+        except curses.error:
+            pass
+    elif search_query:
+        tui_status(stdscr, tui_document_status(search_query, len(search_matches), search_index))
+    else:
+        tui_status(stdscr, tui_document_status())
 
 
 def tui_load_document(path, width):
@@ -1431,6 +1597,10 @@ def tui_main(stdscr, files):
     document_width = None
     doc_scroll = 0
     x_offset = 0
+    search_query = ""
+    search_matches = []
+    search_index = 0
+    search_editing = False
 
     while True:
         height, width = stdscr.getmaxyx()
@@ -1453,23 +1623,61 @@ def tui_main(stdscr, files):
             if document_width != width:
                 document_lines = tui_load_document(current_path, width)
                 document_width = width
-                doc_scroll = min(doc_scroll, max(0, len(document_lines) - 1))
-            tui_render_document(stdscr, current_path, document_lines, doc_scroll, x_offset)
+                doc_scroll = min(doc_scroll, tui_max_scroll(len(document_lines), height))
+                search_matches = tui_find_matches(document_lines, search_query)
+                search_index = tui_initial_match(search_matches, doc_scroll)
+            tui_render_document(
+                stdscr,
+                current_path,
+                document_lines,
+                doc_scroll,
+                x_offset,
+                search_query,
+                search_matches,
+                search_index,
+                search_editing,
+            )
 
         stdscr.refresh()
         key = stdscr.get_wch()
-        key_name = key.lower() if isinstance(key, str) else key
+        key_name = tui_hotkey(key)
 
-        if key_name in {"q", "й"}:
+        if mode == "document" and search_editing:
+            query_changed = False
+            if key in (curses.KEY_ENTER, "\n", "\r", "\x1b"):
+                search_editing = False
+                try:
+                    curses.curs_set(0)
+                except curses.error:
+                    stdscr.leaveok(True)
+            elif key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                if search_query:
+                    search_query = search_query[:-1]
+                    query_changed = True
+            elif isinstance(key, str) and key.isprintable():
+                search_query += key
+                query_changed = True
+
+            if query_changed:
+                search_matches = tui_find_matches(document_lines, search_query)
+                search_index = tui_initial_match(search_matches, doc_scroll)
+                if search_matches:
+                    match_line, match_start, _ = search_matches[search_index]
+                    doc_scroll = min(match_line, tui_max_scroll(len(document_lines), height))
+                    if match_start < x_offset or match_start >= x_offset + max(1, width - 1):
+                        x_offset = max(0, match_start - max(0, width // 3))
+            continue
+
+        if key_name == "q":
             return
 
         if mode == "empty":
             continue
 
         if mode == "list":
-            if key in (curses.KEY_UP,) or key_name in {"k", "л"}:
+            if key in (curses.KEY_UP,) or key_name == "k":
                 selected = max(0, selected - 1)
-            elif key in (curses.KEY_DOWN,) or key_name in {"j", "о"}:
+            elif key in (curses.KEY_DOWN,) or key_name == "j":
                 selected = min(len(files) - 1, selected + 1)
             elif key in (curses.KEY_NPAGE,):
                 selected = min(len(files) - 1, selected + max(1, height - 4))
@@ -1485,17 +1693,23 @@ def tui_main(stdscr, files):
                 document_width = width
                 doc_scroll = 0
                 x_offset = 0
+                search_query = ""
+                search_matches = []
+                search_index = 0
                 mode = "document"
             continue
 
-        if key in (curses.KEY_UP,) or key_name in {"k", "л"}:
+        if key in (curses.KEY_UP,) or key_name == "k":
             doc_scroll = max(0, doc_scroll - 1)
-        elif key in (curses.KEY_DOWN,) or key_name in {"j", "о"}:
-            doc_scroll = min(max(0, len(document_lines) - 1), doc_scroll + 1)
+        elif key in (curses.KEY_DOWN,) or key_name == "j":
+            doc_scroll = min(tui_max_scroll(len(document_lines), height), doc_scroll + 1)
         elif key in (curses.KEY_PPAGE,):
             doc_scroll = max(0, doc_scroll - max(1, height - 3))
         elif key in (curses.KEY_NPAGE, " "):
-            doc_scroll = min(max(0, len(document_lines) - 1), doc_scroll + max(1, height - 3))
+            doc_scroll = min(
+                tui_max_scroll(len(document_lines), height),
+                doc_scroll + max(1, height - 3),
+            )
         elif key in (curses.KEY_LEFT,):
             x_offset = max(0, x_offset - 8)
         elif key in (curses.KEY_RIGHT,):
@@ -1504,12 +1718,35 @@ def tui_main(stdscr, files):
             doc_scroll = 0
             x_offset = 0
         elif key in (curses.KEY_END,):
-            doc_scroll = max(0, len(document_lines) - 1)
-        elif key_name in {"r", "к"}:
+            doc_scroll = tui_max_scroll(len(document_lines), height)
+        elif key_name == "r":
             document_lines = tui_load_document(current_path, width)
             document_width = width
-            doc_scroll = min(doc_scroll, max(0, len(document_lines) - 1))
-        elif key_name in {"b", "и", "\x1b", "\x7f"}:
+            doc_scroll = min(doc_scroll, tui_max_scroll(len(document_lines), height))
+            search_matches = tui_find_matches(document_lines, search_query)
+            search_index = tui_initial_match(search_matches, doc_scroll)
+        elif tui_is_search_key(key):
+            search_query = ""
+            search_matches = []
+            search_index = 0
+            search_editing = True
+            try:
+                curses.curs_set(1)
+            except curses.error:
+                stdscr.leaveok(False)
+        elif key_name == "n" and search_matches:
+            search_index = tui_move_match(search_matches, search_index, 1)
+            match_line, match_start, _ = search_matches[search_index]
+            doc_scroll = min(match_line, tui_max_scroll(len(document_lines), height))
+            if match_start < x_offset or match_start >= x_offset + max(1, width - 1):
+                x_offset = max(0, match_start - max(0, width // 3))
+        elif key_name == "p" and search_matches:
+            search_index = tui_move_match(search_matches, search_index, -1)
+            match_line, match_start, _ = search_matches[search_index]
+            doc_scroll = min(match_line, tui_max_scroll(len(document_lines), height))
+            if match_start < x_offset or match_start >= x_offset + max(1, width - 1):
+                x_offset = max(0, match_start - max(0, width // 3))
+        elif key_name in {"b", "\x1b", "\x7f"}:
             if len(files) > 1:
                 mode = "list"
 

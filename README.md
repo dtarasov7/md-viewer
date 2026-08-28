@@ -1,5 +1,7 @@
 # Markdown Viewer
 
+[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](CHANGELOG.md)
+
 `md_viewer.py` is a small Python 3.8 program for viewing Markdown files with tables. It uses only the Python standard library and can run either as a local browser-based HTML viewer or as a terminal TUI.
 
 ## Features
@@ -12,6 +14,7 @@
 - Markdown pipe tables with column alignment;
 - adaptive TUI column widths;
 - horizontal scrolling for wide tables;
+- interactive, case-insensitive TUI text search with instant highlighting and `n` / `p` navigation between matching lines;
 - basic rendering for headings, lists, blockquotes, links, inline code, and fenced code blocks.
 
 ## Requirements
@@ -77,6 +80,8 @@ Keys:
 - `PgUp` / `PgDn` - page scrolling;
 - `←` / `→` - horizontal scrolling;
 - `Home` / `End` - beginning or end of the document;
+- `F7` (or `/`) - start interactive search (matches update after every typed character);
+- `n` / `p` (Latin or Russian layout, either case) - next / previous search match;
 - `r` - reload the file;
 - `b` - return to the file list;
 - `q` - quit.
