@@ -23,7 +23,7 @@ import urllib.parse
 import webbrowser
 
 
-__VERSION__ = "1.0.0"
+__VERSION__ = "1.2.0"
 APP_TITLE = "Markdown Table Viewer"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
@@ -37,6 +37,27 @@ TUI_KEY_ALIASES = {
     "т": "n",
     "з": "p",
     ".": "/",
+}
+TUI_HOME_KEYS = {
+    curses.KEY_HOME,
+    getattr(curses, "KEY_FIND", curses.KEY_HOME),
+    getattr(curses, "KEY_SHOME", curses.KEY_HOME),
+}
+TUI_END_KEYS = {
+    curses.KEY_END,
+    getattr(curses, "KEY_SELECT", curses.KEY_END),
+    getattr(curses, "KEY_LL", curses.KEY_END),
+    getattr(curses, "KEY_SEND", curses.KEY_END),
+}
+TUI_ESCAPE_KEYS = {
+    "\x1b[H": curses.KEY_HOME,
+    "\x1bOH": curses.KEY_HOME,
+    "\x1b[1~": curses.KEY_HOME,
+    "\x1b[7~": curses.KEY_HOME,
+    "\x1b[F": curses.KEY_END,
+    "\x1bOF": curses.KEY_END,
+    "\x1b[4~": curses.KEY_END,
+    "\x1b[8~": curses.KEY_END,
 }
 
 
@@ -1177,8 +1198,23 @@ def build_parser():
     )
     parser.add_argument("--host", default=DEFAULT_HOST, help="Адрес сервера, по умолчанию 0.0.0.0.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Порт сервера, по умолчанию 8765.")
-    parser.add_argument("--no-browser", action="store_true", help="Не открывать браузер автоматически.")
-    parser.add_argument("--tui", action="store_true", help="Открыть терминальный интерфейс вместо браузера.")
+    parser.add_argument("--no-browser", action="store_true", help="Не открывать браузер в HTML-режиме.")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Показывать в строке состояния коды нажатых клавиш TUI.",
+    )
+    interface = parser.add_mutually_exclusive_group()
+    interface.add_argument(
+        "--tui",
+        action="store_true",
+        help="Открыть терминальный интерфейс (режим по умолчанию).",
+    )
+    interface.add_argument(
+        "--html",
+        action="store_true",
+        help="Открыть HTML-интерфейс через локальный HTTP-сервер.",
+    )
     return parser
 
 
@@ -1319,6 +1355,71 @@ def tui_hotkey(key):
 def tui_is_search_key(key):
     """Return whether a key opens TUI search."""
     return key == curses.KEY_F7 or tui_hotkey(key) == "/"
+
+
+def tui_debug_key(key):
+    """Format a value returned by get_wch for the TUI debug line.
+
+    Форматирует значение get_wch для отладочной строки TUI.
+    """
+    if isinstance(key, str):
+        return "{}:{}".format(ord(key), repr(key))
+    try:
+        name = curses.keyname(key).decode("ascii", errors="replace")
+    except curses.error:
+        name = "UNKNOWN"
+    return "{}:{}".format(key, name)
+
+
+def tui_debug_status(keys, max_width):
+    """Fit the newest key codes into one status line.
+
+    Вмещает последние коды клавиш в одну строку состояния.
+    """
+    prefix = "KEYS: "
+    if not keys:
+        return (prefix + "нажмите клавишу")[:max_width]
+
+    visible = []
+    used = len(prefix)
+    for item in reversed(keys):
+        extra = len(item) + (1 if visible else 0)
+        if used + extra > max_width:
+            break
+        visible.append(item)
+        used += extra
+    return prefix + " ".join(reversed(visible))
+
+
+def tui_read_key(stdscr):
+    """Read one key and decode raw terminal Home/End escape sequences.
+
+    Читает клавишу и декодирует сырые escape-последовательности Home/End.
+    """
+    first = stdscr.get_wch()
+    raw_keys = [first]
+    if first != "\x1b":
+        return first, raw_keys
+
+    sequence = first
+    stdscr.timeout(100)
+    try:
+        while len(sequence) < max(len(item) for item in TUI_ESCAPE_KEYS):
+            try:
+                next_key = stdscr.get_wch()
+            except curses.error:
+                break
+            raw_keys.append(next_key)
+            if not isinstance(next_key, str):
+                break
+            sequence += next_key
+            if sequence in TUI_ESCAPE_KEYS:
+                return TUI_ESCAPE_KEYS[sequence], raw_keys
+            if not any(item.startswith(sequence) for item in TUI_ESCAPE_KEYS):
+                break
+    finally:
+        stdscr.timeout(-1)
+    return first, raw_keys
 
 
 def tui_slice(line, x_offset):
@@ -1473,7 +1574,7 @@ def tui_document_status(search_query="", match_count=0, search_index=0):
         search_status = "F7 поиск"
     return (
         "↑↓ PgUp/PgDn | ←→ горизонтально | {} | "
-        "Home/End | r обновить | b список | q выход"
+        "Home/End | r обновить | b назад к списку | q выход"
     ).format(search_status)
 
 
@@ -1568,7 +1669,7 @@ def tui_load_document(path, width):
     return render_tui_document(source, max(40, width - 1))
 
 
-def tui_main(stdscr, files):
+def tui_main(stdscr, files, debug=False):
     """Run the curses event loop.
 
     Запускает цикл событий curses.
@@ -1576,12 +1677,17 @@ def tui_main(stdscr, files):
     Args:
         stdscr: Curses root window / корневое окно curses.
         files (list[Path]): Files to browse / файлы для просмотра.
+        debug (bool): Show received key codes / показывать полученные коды клавиш.
 
     Returns:
         None.
     """
     curses.cbreak()
     stdscr.keypad(True)
+    wheel_up = getattr(curses, "BUTTON4_PRESSED", 0)
+    # Python 3.8/3.9 omit button 5 even with the ncurses five-bit mouse layout.
+    wheel_down = getattr(curses, "BUTTON5_PRESSED", wheel_up << 5)
+    curses.mousemask(wheel_up | wheel_down)
     try:
         curses.curs_set(0)
     except curses.error:
@@ -1601,6 +1707,7 @@ def tui_main(stdscr, files):
     search_matches = []
     search_index = 0
     search_editing = False
+    debug_keys = []
 
     while True:
         height, width = stdscr.getmaxyx()
@@ -1638,8 +1745,30 @@ def tui_main(stdscr, files):
                 search_editing,
             )
 
+        if debug:
+            tui_status(stdscr, tui_debug_status(debug_keys, max(0, width - 1)))
         stdscr.refresh()
-        key = stdscr.get_wch()
+        key, raw_keys = tui_read_key(stdscr)
+        if debug:
+            debug_keys.extend(tui_debug_key(raw_key) for raw_key in raw_keys)
+            debug_keys = debug_keys[-100:]
+        if key == curses.KEY_MOUSE:
+            try:
+                _, _, _, _, buttons = curses.getmouse()
+            except curses.error as error:
+                if debug:
+                    debug_keys.append("getmouse: {}".format(error))
+                continue
+            delta = -3 if buttons & wheel_up else 3 if buttons & wheel_down else 0
+            if delta:
+                if mode == "document":
+                    doc_scroll = max(0, min(
+                        tui_max_scroll(len(document_lines), height), doc_scroll + delta,
+                    ))
+                elif mode == "list":
+                    selected = max(0, min(len(files) - 1, selected + delta))
+            continue
+
         key_name = tui_hotkey(key)
 
         if mode == "document" and search_editing:
@@ -1683,9 +1812,9 @@ def tui_main(stdscr, files):
                 selected = min(len(files) - 1, selected + max(1, height - 4))
             elif key in (curses.KEY_PPAGE,):
                 selected = max(0, selected - max(1, height - 4))
-            elif key in (curses.KEY_HOME,):
+            elif key in TUI_HOME_KEYS:
                 selected = 0
-            elif key in (curses.KEY_END,):
+            elif key in TUI_END_KEYS:
                 selected = len(files) - 1
             elif key in (curses.KEY_ENTER, "\n", "\r"):
                 current_path = files[selected]
@@ -1714,10 +1843,10 @@ def tui_main(stdscr, files):
             x_offset = max(0, x_offset - 8)
         elif key in (curses.KEY_RIGHT,):
             x_offset += 8
-        elif key in (curses.KEY_HOME,):
+        elif key in TUI_HOME_KEYS:
             doc_scroll = 0
             x_offset = 0
-        elif key in (curses.KEY_END,):
+        elif key in TUI_END_KEYS:
             doc_scroll = tui_max_scroll(len(document_lines), height)
         elif key_name == "r":
             document_lines = tui_load_document(current_path, width)
@@ -1765,7 +1894,7 @@ def run_tui(args):
     root = Path.cwd()
     files = normalize_files(root, args.files)
     locale.setlocale(locale.LC_ALL, "")
-    curses.wrapper(tui_main, files)
+    curses.wrapper(tui_main, files, args.debug)
 
 
 def main(argv=None):
@@ -1780,10 +1909,10 @@ def main(argv=None):
         int: Process exit code / код завершения процесса.
     """
     args = build_parser().parse_args(argv)
-    if args.tui:
-        run_tui(args)
-    else:
+    if args.html:
         serve(args)
+    else:
+        run_tui(args)
     return 0
 
 
